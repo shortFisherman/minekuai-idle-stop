@@ -1,0 +1,7 @@
+{
+  "instance": "0123abcd",
+  "host": "node.example.net",
+  "port": 25565,
+  "idle_seconds": 600,
+  "poll_seconds": 30
+}

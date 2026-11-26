@@ -1,0 +1,13 @@
+/.local/
+/config.json
+/auth.json
+/state.json
+/auth.json.*
+/known_hosts
+/.deploy-deps/
+/.venv/
+/.wheelhouse/
+__pycache__/
+*.py[cod]
+*.log
+.env*

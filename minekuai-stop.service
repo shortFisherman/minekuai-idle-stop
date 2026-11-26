@@ -1,0 +1,26 @@
+[Unit]
+Description=Minekuai Minecraft idle shutdown
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=minekuai-stop
+ConfigurationDirectory=minekuai-stop
+LoadCredential=minekuai-auth.json:/etc/minekuai-stop/auth.json
+WorkingDirectory=/opt/minekuai-stop
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/minekuai-stop/venv/bin/python /opt/minekuai-stop/monitor.py --auth ${CREDENTIALS_DIRECTORY}/minekuai-auth.json --state ${STATE_DIRECTORY}/state.json
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
