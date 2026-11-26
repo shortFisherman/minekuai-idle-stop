@@ -7,6 +7,7 @@ import logging
 import socket
 import struct
 import time
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
 from websockets.sync.client import connect
@@ -27,6 +28,23 @@ class APIError(Exception):
 
 class AuthError(APIError):
     pass
+
+
+class RateLimitError(APIError):
+    def __init__(self, retry_after=None):
+        delay = 300
+        if retry_after:
+            try:
+                if retry_after.isascii() and retry_after.isdecimal():
+                    delay = int(retry_after)
+                else:
+                    until = parsedate_to_datetime(retry_after)
+                    if until.tzinfo is not None:
+                        delay = max(0, until.timestamp() - time.time())
+            except (OverflowError, OSError, TypeError, ValueError):
+                pass
+        self.retry_after = max(60, delay)
+        super().__init__("麦块返回限流，已延后下一次查询")
 
 
 class Minekuai:
@@ -58,6 +76,8 @@ class Minekuai:
             response = conn.getresponse()
             if response.status in (401, 419):
                 raise AuthError("麦块会话失效，需要重新授权")
+            if response.status == 429:
+                raise RateLimitError(response.getheader("Retry-After"))
             if response.status != 200:
                 raise APIError(f"麦块接口返回 HTTP {response.status}")
             body = json.loads(response.read(2_097_153))
@@ -71,6 +91,8 @@ class Minekuai:
         code = body.get("code")
         if code in (401, 419, "401", "419"):
             raise AuthError("麦块会话失效，需要重新授权")
+        if code in (429, "429"):
+            raise RateLimitError(response.getheader("Retry-After"))
         if type(code) in (str, int) and str(code) in {"200", "0"}:
             return body.get("data")
         if allow_uncoded and "code" not in body and isinstance(body.get("data"), dict):

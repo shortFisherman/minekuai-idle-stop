@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from minekuai import APIError
+from minekuai import APIError, RateLimitError
 from monitor import Monitor
 
 
@@ -103,6 +103,56 @@ class MonitorTest(unittest.TestCase):
             self.tick(0)
         self.api.request_stop.assert_not_called()
         self.api.pause_billing.assert_not_called()
+
+
+    def test_hourly_check_triggers_on_second_empty_sample(self):
+        self.monitor.idle_samples = 2
+        self.monitor.poll_seconds = 3600
+        self.now.return_value = 0
+        self.assertEqual(self.monitor.run_cycle(), 3600)
+        self.api.request_stop.assert_not_called()
+        self.now.return_value = 3600
+        self.assertEqual(self.monitor.run_cycle(), 30)
+        self.api.request_stop.assert_called_once()
+
+    def test_hourly_check_resets_on_unknown_player_count_or_new_cycle(self):
+        self.monitor.idle_samples = 2
+        self.monitor.poll_seconds = 3600
+        self.tick(0)
+        self.probe.return_value = None
+        self.tick(3600)
+        self.probe.return_value = 0
+        self.tick(7200)
+        self.probe.return_value = 1
+        self.tick(10800)
+        self.probe.return_value = 0
+        self.tick(14400)
+        self.api.billing_cycle.return_value = "new-cycle"
+        self.tick(18000)
+        self.api.request_stop.assert_not_called()
+        self.tick(21600)
+        self.api.request_stop.assert_called_once()
+
+    def test_rate_limit_can_extend_hourly_interval(self):
+        self.monitor.idle_samples = 2
+        self.monitor.poll_seconds = 3600
+        self.tick(0)
+        self.api.billing_cycle.side_effect = RateLimitError("7200")
+        self.assertEqual(self.monitor.run_cycle(), 7200)
+        self.assertEqual(self.monitor.empty_samples, 0)
+
+    def test_hourly_check_resumes_after_billing_pause_is_verified(self):
+        self.monitor.idle_samples = 2
+        self.monitor.poll_seconds = 3600
+        self.monitor.record("stop_requested", "test-cycle")
+        self.api.power_state.return_value = "offline"
+        self.probe.return_value = None
+        self.now.return_value = 0
+        self.assertEqual(self.monitor.run_cycle(), 30)
+        self.api.pause_billing.side_effect = lambda: setattr(self.api.billing_cycle, "return_value", None)
+        self.now.return_value = 30
+        self.assertEqual(self.monitor.run_cycle(), 3600)
+        self.api.pause_billing.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -32,6 +32,15 @@ class SetupTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 load_config(config)
 
+    def test_hourly_sample_count_config(self):
+        config = self.directory / "config.json"
+        config.write_text(
+            '{"instance":"0123abcd","host":"node.example.net","port":25565,"poll_seconds":3600,"idle_samples":2}',
+            encoding="utf-8",
+        )
+        result = load_config(config)
+        self.assertEqual((result.poll_seconds, result.idle_samples), (3600, 2))
+
     def test_cookie_client_id_and_url_encoding(self):
         payload = base64.urlsafe_b64encode(b'{"clientid":"demo-client"}').decode().rstrip("=")
         token = f"header.{payload}.signature"

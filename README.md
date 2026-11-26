@@ -63,6 +63,10 @@ sudo journalctl -u minekuai-stop.service -f
 
 `--check` 是只读检查。实例暂停计费、游戏服还在启动或状态查询失败时，在线人数会显示为 `null`。希望先观察倒计时，可以在启用服务前手动运行 `monitor.py --dry-run`，确认日志后按 Ctrl+C 退出，再启用服务。
 
+### 按次数判断空服
+
+在实例配置中设置 `"poll_seconds": 3600` 和 `"idle_samples": 2`，即可每小时查询一次，同一计费周期连续两次查到 0 人后发起关停。启用 `idle_samples` 时按查询次数判断，允许查询间隔最长 3600 秒。有人在线、人数未知或计费周期改变都会清空空服记录。关服流程发起后会短时复查停服和停费结果。如果收到限流响应，程序会按服务端给出的等待时间延后查询。
+
 ## 日常运维
 
 - **临时保留空服**。运行 `sudo systemctl stop minekuai-stop.service`，玩完后用 `sudo systemctl start minekuai-stop.service` 恢复。重新启动服务会重新计空闲时间。
