@@ -41,7 +41,11 @@ def replace_auth(instance, path, session):
         try:
             json.dump(session, stream)
             stream.close()
-            Minekuai(instance, staged).billing_cycle()
+            api = Minekuai(instance, staged)
+            if instance is None:
+                api.billing_instances()
+            else:
+                api.billing_cycle()
             staged.replace(path)
         finally:
             staged.unlink(missing_ok=True)

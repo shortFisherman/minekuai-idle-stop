@@ -11,3 +11,6 @@ __pycache__/
 *.py[cod]
 *.log
 .env*
+/state-*.json
+/keepalive.json
+/keepalive-*.json

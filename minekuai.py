@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import logging
+import re
 import socket
 import struct
 import time
@@ -52,8 +53,9 @@ class Minekuai:
         self.instance = instance
         self.auth_file = auth_file
         self.panel = f"/panel/servers/{instance}"
+        self.expected_endpoint = None
 
-    def request(self, method, path, *, allow_uncoded=False):
+    def request(self, method, path, *, allow_uncoded=False, rows=False, timeout=10):
         try:
             auth = json.loads(self.auth_file.read_text(encoding="utf-8"))
             token, client_id = auth["token"], auth["clientid"]
@@ -63,7 +65,7 @@ class Minekuai:
         except (OSError, KeyError, TypeError, ValueError):
             raise AuthError("麦块会话文件缺失或格式无效") from None
 
-        conn = http.client.HTTPSConnection(API_HOST, timeout=10)
+        conn = http.client.HTTPSConnection(API_HOST, timeout=timeout)
         try:
             conn.request(method, path, headers={
                 "Authorization": f"Bearer {token}",
@@ -94,23 +96,31 @@ class Minekuai:
         if code in (429, "429"):
             raise RateLimitError(response.getheader("Retry-After"))
         if type(code) in (str, int) and str(code) in {"200", "0"}:
-            return body.get("data")
+            return body.get("rows" if rows else "data")
         if allow_uncoded and "code" not in body and isinstance(body.get("data"), dict):
             return body["data"]
         safe_code = str(code) if type(code) in (str, int) and str(code).isdigit() else "缺失"
         raise APIError(f"麦块接口未确认成功（业务码 {safe_code}）")
 
-    def billing_cycle(self):
-        cards = self.request("GET", "/system/timeBalance/user/userPackages")
+    def billing_instances(self, *, timeout=10):
+        cards = self.request("GET", "/system/timeBalance/user/userPackages", timeout=timeout)
         if not isinstance(cards, list):
             raise APIError("计时卡列表结构异常")
-        matches = [
-            item for card in cards if isinstance(card, dict) and isinstance(card.get("instances"), list)
-            for item in card["instances"] if isinstance(item, dict) and item.get("serverId") == self.instance
-        ]
-        if len(matches) != 1:
-            raise APIError("计时卡列表未返回唯一的目标实例")
-        item = matches[0]
+        instances = {}
+        for card in cards:
+            rows = card.get("instances") if isinstance(card, dict) else None
+            if not isinstance(rows, list):
+                continue
+            for item in rows:
+                identifier = item.get("serverId") if isinstance(item, dict) else None
+                if isinstance(identifier, str) and re.fullmatch(r"[a-f0-9]{8}", identifier):
+                    if identifier in instances:
+                        raise APIError("计时卡列表含重复实例，暂停自动操作")
+                    instances[identifier] = item
+        return instances
+
+    @staticmethod
+    def cycle_from_record(item):
         status = item.get("timingStatus")
         if type(status) not in (int, str) or str(status) not in {"0", "1"}:
             raise APIError("目标实例计费状态未知")
@@ -121,8 +131,51 @@ class Minekuai:
             raise APIError("目标实例正在计费，但无法确认本次计费的开始时间")
         return str(cycle)
 
+    def billing_cycle(self, *, timeout=10):
+        item = self.billing_instances(timeout=timeout).get(self.instance)
+        if item is None:
+            raise APIError("计时卡列表未返回目标实例")
+        return self.cycle_from_record(item)
+
+    def endpoint_from_panel(self, info):
+        attr = info.get("attributes") if isinstance(info, dict) else None
+        meta = info.get("meta") if isinstance(info, dict) else None
+        if (not isinstance(attr, dict) or attr.get("identifier") != self.instance
+                or attr.get("is_time_based") not in (1, True)
+                or not isinstance(meta, dict) or meta.get("is_server_owner") is not True):
+            raise APIError("面板未确认目标是账号所有的计时卡实例")
+        try:
+            allocations = info["attributes"]["relationships"]["allocations"]["data"]
+            primary = [row["attributes"] for row in allocations if row["attributes"].get("is_default") is True]
+            if len(primary) != 1:
+                raise ValueError
+            address = primary[0]
+            host = address.get("ip_alias") or address.get("ip")
+            port = address.get("port")
+            if (not isinstance(host, str) or host in {"", "0.0.0.0", "::", "*"}
+                    or any(char.isspace() for char in host)
+                    or type(port) is not int or not 1 <= port <= 65535):
+                raise ValueError
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise APIError("面板未提供明确的主联机地址") from None
+        return host, port
+
+    def instance_endpoint(self):
+        return self.endpoint_from_panel(self.request("GET", self.panel))
+
+    def recent_billing_ends(self):
+        path = f"/system/system/timeConsumptionDetail/user/list?pageNum=1&pageSize=6&serverId={self.instance}"
+        rows = self.request("GET", path, rows=True)
+        if not isinstance(rows, list):
+            raise APIError("麦块计费记录格式异常")
+        return [item.get("billingPeriodEnd") for item in rows
+                if isinstance(item, dict) and item.get("serverId") == self.instance
+                and item.get("billingType") in (0, "0")]
+
     def ensure_available(self):
         info = self.request("GET", self.panel)
+        if self.expected_endpoint is not None and self.endpoint_from_panel(info) != self.expected_endpoint:
+            raise APIError("实例主联机地址已变化，取消本次关服")
         attr = info.get("attributes") if isinstance(info, dict) else None
         flags = ("is_suspended", "is_installing", "is_transferring", "is_node_under_maintenance")
         if (not isinstance(attr, dict) or attr.get("identifier") != self.instance
@@ -130,8 +183,8 @@ class Minekuai:
                 or any(attr.get(flag) is not False for flag in flags)):
             raise APIError("面板显示实例不可操作，或处于安装、迁移、维护状态")
 
-    def power_state(self):
-        info = self.request("GET", self.panel + "/resources")
+    def power_state(self, *, timeout=10):
+        info = self.request("GET", self.panel + "/resources", timeout=timeout)
         attr = info.get("attributes") if isinstance(info, dict) else None
         state = attr.get("current_state") if isinstance(attr, dict) else None
         if not isinstance(state, str) or state not in STATES:
@@ -187,8 +240,11 @@ class Minekuai:
         except Exception:
             raise APIError("实时控制台连接或发送结果不明，请核对停服状态") from None
 
-    def pause_billing(self):
-        self.request("POST", f"/system/timeBalance/user/instance/{self.instance}/stop")
+    def resume_billing(self):
+        self.request("POST", f"/system/timeBalance/user/instance/{self.instance}/start", timeout=4)
+
+    def pause_billing(self, *, timeout=10):
+        self.request("POST", f"/system/timeBalance/user/instance/{self.instance}/stop", timeout=timeout)
 
 
 def encode_varint(value):
