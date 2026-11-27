@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from keepalive import Keepalive, RECHECK_SECONDS
-from minekuai import APIError, Minekuai, RateLimitError, online_count
+from minekuai import APIError, Minekuai, RateLimitError, instance_operation_lock, online_count
 
 LOG = logging.getLogger("minekuai-stop")
 DEFAULT_CONFIG = Path("/etc/minekuai-stop/config.json")
@@ -286,7 +286,12 @@ class AccountMonitor:
                 try:
                     cycle = self.account.cycle_from_record(records[instance])
                     target = self.target(instance, started)
-                    delay = target.run_cycle(cycle, raise_on_limit=True)
+                    with instance_operation_lock(self.state_file.parent, instance) as locked:
+                        if not locked:
+                            target.reset_idle()
+                            self.followups.pop(instance, None)
+                            continue
+                        delay = target.run_cycle(cycle, raise_on_limit=True)
                 except RateLimitError as exc:
                     if target and (target.following_up or (target.keepalive and target.keepalive.following_up)):
                         self.followups[instance] = time.monotonic() + exc.retry_after

@@ -1,0 +1,14 @@
+[Unit]
+Description=Reconcile incomplete Minekuai cold backup billing
+
+[Service]
+Type=oneshot
+ExecStart=/opt/minekuai-stop/venv/bin/python -B /opt/minekuai-stop/cold_backup.py recover
+StateDirectory=minekuai-cold
+StateDirectoryMode=0700
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/minekuai-stop
+NoNewPrivileges=true
+PrivateTmp=true

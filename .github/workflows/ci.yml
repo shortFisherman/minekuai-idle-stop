@@ -21,8 +21,12 @@ jobs:
       - name: Validate Linux installation
         run: |
           python -m pip download --only-binary=:all: --platform any -r requirements.txt -d "$RUNNER_TEMP/minekuai-wheels"
-          sudo env "PATH=$PATH" "WHEEL_DIR=$RUNNER_TEMP/minekuai-wheels" bash install.sh
+          sudo env "PATH=$PATH" "WHEEL_DIR=$RUNNER_TEMP/minekuai-wheels" bash install.sh --cold-backup
           cmp config.example.json /etc/minekuai-stop/config.json
           /opt/minekuai-stop/venv/bin/python /opt/minekuai-stop/monitor.py --help
           /opt/minekuai-stop/venv/bin/python /opt/minekuai-stop/authorize.py --help
+          /opt/minekuai-stop/venv/bin/python /opt/minekuai-stop/cold_backup.py --help
           sudo systemd-analyze verify /etc/systemd/system/minekuai-stop.service
+          sudo systemd-analyze verify /etc/systemd/system/minekuai-cold.service \
+            /etc/systemd/system/minekuai-cold.timer /etc/systemd/system/minekuai-cold-recover.service \
+            /etc/systemd/system/minekuai-cold-recover.timer

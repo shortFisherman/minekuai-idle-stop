@@ -1,0 +1,9 @@
+[Unit]
+Description=Check weekly Minekuai cold backup at 02:00 China time
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 Asia/Shanghai
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

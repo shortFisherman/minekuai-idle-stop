@@ -4,14 +4,19 @@ import http.client
 import io
 import json
 import logging
+import os
 import re
 import socket
 import struct
 import time
+from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
 from websockets.sync.client import connect
+
+if os.name == "posix":
+    import fcntl
 
 API_HOST = "api.minekuai.cn"
 ORIGIN = "https://minekuai.com"
@@ -28,6 +33,10 @@ class APIError(Exception):
 
 
 class AuthError(APIError):
+    pass
+
+
+class InstanceNotFound(APIError):
     pass
 
 
@@ -48,6 +57,25 @@ class RateLimitError(APIError):
         super().__init__("麦块返回限流，已延后下一次查询")
 
 
+@contextmanager
+def instance_operation_lock(directory, instance):
+    """Coordinate billing changes made by the local backup and idle-stop workers."""
+    if os.name != "posix":
+        yield True
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / f".operation-{instance}.lock").open("a") as handle:
+        if os.geteuid() == 0:
+            owner = directory.stat()
+            os.fchown(handle.fileno(), owner.st_uid, owner.st_gid)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
 class Minekuai:
     def __init__(self, instance, auth_file):
         self.instance = instance
@@ -55,7 +83,8 @@ class Minekuai:
         self.panel = f"/panel/servers/{instance}"
         self.expected_endpoint = None
 
-    def request(self, method, path, *, allow_uncoded=False, rows=False, timeout=10):
+    def request(self, method, path, *, allow_uncoded=False, rows=False, timeout=10,
+                payload=None, allow_empty=False):
         try:
             auth = json.loads(self.auth_file.read_text(encoding="utf-8"))
             token, client_id = auth["token"], auth["clientid"]
@@ -67,20 +96,32 @@ class Minekuai:
 
         conn = http.client.HTTPSConnection(API_HOST, timeout=timeout)
         try:
-            conn.request(method, path, headers={
+            headers = {
                 "Authorization": f"Bearer {token}",
                 "clientid": client_id,
                 "Origin": ORIGIN,
                 "Referer": ORIGIN + "/",
                 "Accept": "application/json",
                 "User-Agent": "Minekuai-Idle-Stop/0.1",
-            })
+            }
+            body = None
+            if payload is not None:
+                headers["Content-Type"] = "application/json"
+                body = json.dumps(payload).encode("utf-8")
+            if body is None:
+                conn.request(method, path, headers=headers)
+            else:
+                conn.request(method, path, body=body, headers=headers)
             response = conn.getresponse()
             if response.status in (401, 419):
                 raise AuthError("麦块会话失效，需要重新授权")
             if response.status == 429:
                 raise RateLimitError(response.getheader("Retry-After"))
-            if response.status != 200:
+            if response.status == 404:
+                raise InstanceNotFound("麦块未找到该实例")
+            if allow_empty and response.status == 204:
+                return None
+            if response.status not in ((200, 201, 202) if payload is not None else (200,)):
                 raise APIError(f"麦块接口返回 HTTP {response.status}")
             body = json.loads(response.read(2_097_153))
         except (OSError, http.client.HTTPException, ValueError):
@@ -95,6 +136,8 @@ class Minekuai:
             raise AuthError("麦块会话失效，需要重新授权")
         if code in (429, "429"):
             raise RateLimitError(response.getheader("Retry-After"))
+        if code in (404, "404"):
+            raise InstanceNotFound("麦块未找到该实例")
         if type(code) in (str, int) and str(code) in {"200", "0"}:
             return body.get("rows" if rows else "data")
         if allow_uncoded and "code" not in body and isinstance(body.get("data"), dict):
@@ -102,7 +145,7 @@ class Minekuai:
         safe_code = str(code) if type(code) in (str, int) and str(code).isdigit() else "缺失"
         raise APIError(f"麦块接口未确认成功（业务码 {safe_code}）")
 
-    def billing_instances(self, *, timeout=10):
+    def billing_instances(self, *, timeout=10, strict=False):
         cards = self.request("GET", "/system/timeBalance/user/userPackages", timeout=timeout)
         if not isinstance(cards, list):
             raise APIError("计时卡列表结构异常")
@@ -110,6 +153,8 @@ class Minekuai:
         for card in cards:
             rows = card.get("instances") if isinstance(card, dict) else None
             if not isinstance(rows, list):
+                if strict:
+                    raise APIError("计时卡列表不完整")
                 continue
             for item in rows:
                 identifier = item.get("serverId") if isinstance(item, dict) else None
@@ -117,6 +162,8 @@ class Minekuai:
                     if identifier in instances:
                         raise APIError("计时卡列表含重复实例，暂停自动操作")
                     instances[identifier] = item
+                elif strict:
+                    raise APIError("计时卡列表含无法核对的实例")
         return instances
 
     @staticmethod

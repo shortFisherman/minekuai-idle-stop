@@ -2,6 +2,14 @@
 set -euo pipefail
 umask 022
 
+cold_backup=false
+if [[ $# -eq 1 && $1 == --cold-backup ]]; then
+    cold_backup=true
+elif (( $# != 0 )); then
+    printf '%s\n' '用法: sudo bash install.sh [--cold-backup]' >&2
+    exit 1
+fi
+
 if (( EUID != 0 )); then
     printf '%s\n' '请使用 sudo bash install.sh 安装。' >&2
     exit 1
@@ -28,5 +36,12 @@ if [[ ! -e "$conf/config.json" ]]; then
     install -m 644 "$src/config.example.json" "$conf/config.json"
 fi
 install -m 644 "$src/minekuai-stop.service" "$unit"
+if "$cold_backup"; then
+    install -m 644 "$src/cold_backup.py" "$src/cold_zip.py" \
+        "$src/backup_files.py" "$src/backup_state.py" "$app/"
+    install -m 644 "$src/minekuai-cold.service" "$src/minekuai-cold.timer" \
+        "$src/minekuai-cold-recover.service" "$src/minekuai-cold-recover.timer" \
+        /etc/systemd/system/
+fi
 systemctl daemon-reload
 printf '%s\n' '安装完成。按 README 配置实例，授权并检查连接后再启动服务。'
