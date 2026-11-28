@@ -31,7 +31,8 @@ if [[ -n "${WHEEL_DIR:-}" ]]; then
 fi
 "$app/venv/bin/python" -m pip install "${pip_args[@]}"
 
-install -m 644 "$src/monitor.py" "$src/minekuai.py" "$src/keepalive.py" "$src/authorize.py" "$app/"
+install -m 644 "$src/monitor.py" "$src/minekuai.py" "$src/keepalive.py" "$src/inventory.py" "$src/authorize.py" "$app/"
+install -m 644 "$src/status.py" "$app/"
 if [[ ! -e "$conf/config.json" ]]; then
     install -m 644 "$src/config.example.json" "$conf/config.json"
 fi

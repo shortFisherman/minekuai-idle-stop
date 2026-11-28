@@ -74,10 +74,39 @@ class MonitorTest(unittest.TestCase):
         self.api.pause_billing.assert_called_once()
         self.assertIsNone(self.monitor.read_pending())
 
-    def test_uncertain_billing_write_is_not_repeated(self):
+    def test_uncertain_billing_write_is_not_repeated_while_server_is_running(self):
         self.monitor.record("pause_requested", "test-cycle")
         self.tick(0)
         self.tick(30)
+        self.api.pause_billing.assert_not_called()
+
+    def test_lost_pause_request_retries_after_rechecking_cycle_and_power(self):
+        self.api.power_state.return_value = "offline"
+        self.probe.return_value = None
+
+        def confirm_pause():
+            if self.api.pause_billing.call_count == 1:
+                raise APIError("request lost")
+            self.api.billing_cycle.return_value = None
+
+        self.api.pause_billing.side_effect = confirm_pause
+        with patch("monitor.time.time", return_value=100) as wall:
+            self.monitor.record("stop_requested", "test-cycle")
+            self.tick(0)
+            self.tick(30)
+            self.assertEqual(self.api.pause_billing.call_count, 1)
+            wall.return_value = 130
+            self.tick(60)
+        self.assertEqual(self.api.pause_billing.call_count, 2)
+        self.assertIsNone(self.monitor.read_pending())
+
+    def test_unconfirmed_stop_expires_and_restarts_idle_checks(self):
+        with patch("monitor.time.time", return_value=100) as wall:
+            self.monitor.record("stop_requested", "test-cycle")
+            wall.return_value = 280
+            self.tick(180)
+        self.assertIsNone(self.monitor.read_pending())
+        self.assertEqual(self.monitor.empty_samples, 0)
         self.api.pause_billing.assert_not_called()
 
     def test_billing_cycle_change_cancels_old_shutdown(self):

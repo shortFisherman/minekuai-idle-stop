@@ -3,7 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from keepalive import CHINA_TIME, Keepalive
 from minekuai import APIError
@@ -69,3 +69,20 @@ class KeepaliveTest(unittest.TestCase):
         self.api.resume_billing.assert_not_called()
         self.api.pause_billing.assert_not_called()
         self.assertGreater(self.job.read()["next_after"], time.time() + 5 * 86400)
+
+    def test_retries_lost_pause_after_fast_followup_window(self):
+        requested = 1700000000
+        cycle = datetime.fromtimestamp(requested, CHINA_TIME).isoformat(timespec="seconds")
+        self.api.power_state.return_value = "offline"
+        self.api.billing_cycle.side_effect = [cycle, cycle, cycle, cycle, cycle, None]
+        self.api.pause_billing.side_effect = [APIError("failed"), APIError("failed"), None]
+        self.job.save({"next_after": 0, "requested_at": requested, "pause_sent": False})
+        with patch("keepalive.time.time") as wall:
+            for seconds in (0, 5, 10):
+                wall.return_value = requested + seconds
+                self.job.step(cycle)
+            self.assertEqual(self.api.pause_billing.call_count, 2)
+            wall.return_value = requested + 3600
+            self.job.step(cycle)
+        self.assertEqual(self.api.pause_billing.call_count, 3)
+        self.assertNotIn("requested_at", self.job.read())

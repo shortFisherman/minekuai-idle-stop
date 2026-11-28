@@ -10,10 +10,11 @@ from urllib.parse import quote
 from uuid import UUID
 
 from backup_files import FileSource
-from backup_state import BackupRetirement, INSTANCE_ID, read_state, store_json
+from backup_state import BackupRetirement, CONFIRM_MISSING_AFTER, RETIRE_AFTER, read_state, store_json
 from cold_zip import LOG, RESERVE_BYTES, archive_name, available, prune_previous, publish, stored_matches, verify
+from inventory import INSTANCE_ID, Inventory
 from keepalive import CHINA_TIME, timestamp
-from minekuai import APIError, Minekuai, RateLimitError, instance_operation_lock, online_count
+from minekuai import APIError, AuthError, Minekuai, RateLimitError, instance_operation_lock, online_count
 
 MAX_SECONDS = 45 * 60
 MIN_DAYS = 7
@@ -23,7 +24,8 @@ class ColdBackup:
     def __init__(self, auth, root, monitor_state):
         self.root = root
         self.monitor_state = monitor_state
-        self.account = Minekuai("account", auth)
+        self.account = Minekuai("account", auth, state_directory=monitor_state)
+        self.inventory = Inventory(self.account, monitor_state)
         self.instances = root / "instances"
         self.retirement = BackupRetirement(self.account, self.instances)
         self.instances.mkdir(parents=True, exist_ok=True)
@@ -38,7 +40,7 @@ class ColdBackup:
         return path
 
     def api_for(self, instance):
-        return Minekuai(instance, self.account.auth_file)
+        return self.account.for_instance(instance)
 
     def settle(self, api, journal):
         record = read_state(journal)
@@ -146,16 +148,21 @@ class ColdBackup:
         LOG.info("实例 %s：面板已确认停服，正在打包 %d 个根目录条目",
                  source.api.instance, len(entries))
         pending = area / "task.json"
-        record = {"roots": sorted(entries)}
+        record = {"roots": sorted(entries), "needs_review": "task_id_missing"}
         store_json(pending, record)
-        task = source.api.request(
-            "POST", source.path + "/tasks/compress",
-            payload={"root": "/", "files": [quote(name, safe="") for name in record["roots"]], "waitMs": 0},
-        )
+        try:
+            task = source.api.request(
+                "POST", source.path + "/tasks/compress",
+                payload={"root": "/", "files": [quote(name, safe="") for name in record["roots"]], "waitMs": 0},
+            )
+        except (AuthError, RateLimitError):
+            pending.unlink(missing_ok=True)
+            raise
         try:
             record["id"] = str(UUID(task["id"]))
         except (TypeError, KeyError, ValueError, AttributeError):
             raise APIError("压缩任务提交状态不明，保留现场") from None
+        del record["needs_review"]
         store_json(pending, record)
         return record
 
@@ -170,7 +177,8 @@ class ColdBackup:
                 task = next((item for item in self.list_tasks(source)
                              if isinstance(item, dict) and item.get("id") == task_id), None)
                 if not task:
-                    raise APIError("麦块未返回本轮压缩任务")
+                    store_json(pending, {**record, "needs_review": "task_not_found"})
+                    raise APIError("麦块未返回本轮压缩任务，暂停该实例的冷备份")
                 status = task.get("state")
                 if status == "done":
                     break
@@ -190,6 +198,7 @@ class ColdBackup:
             store_json(pending, record)
         if not archive_name(name):
             raise APIError("无效的待处理压缩包记录")
+        archived_on = datetime.fromisoformat(name[8:18]).date().isoformat()
         latest = read_state(area / "latest.json")
         final = area / name
         have_zip = latest.get("file") == name and stored_matches(final, latest)
@@ -216,8 +225,9 @@ class ColdBackup:
                 source.download(PurePosixPath("/") / name, temp, size, resume=True)
                 checksum = verify(temp, size, record["roots"])
                 final = publish(area, temp, name)
-                today = datetime.now(CHINA_TIME).date().isoformat()
-                store_json(area / "latest.json", {"file": name, "size": size, "sha256": checksum, "date": today})
+                store_json(area / "latest.json", {
+                    "file": name, "size": size, "sha256": checksum, "date": archived_on,
+                })
                 LOG.info("实例 %s：整服 ZIP 已校验，保留最新一份", source.api.instance)
             finally:
                 temp.unlink(missing_ok=True)
@@ -230,15 +240,45 @@ class ColdBackup:
         pending.unlink(missing_ok=True)
         LOG.info("实例 %s：已核对麦块临时 ZIP 清理完成", source.api.instance)
 
+    def backup_due(self, area):
+        if (area / "billing.json").is_file():
+            return True
+        task = read_state(area / "task.json")
+        if task:
+            return not task.get("needs_review")
+        try:
+            last = read_state(area / "latest.json")
+            if not archive_name(last.get("file")):
+                return True
+            archive = area / last["file"]
+            if archive.is_symlink() or not archive.is_file() or archive.stat().st_size != last.get("size"):
+                return True
+            saved = datetime.fromisoformat(last["date"]).date()
+        except (KeyError, TypeError, ValueError):
+            return True
+        return (datetime.now(CHINA_TIME).date() - saved).days >= MIN_DAYS
+
+    def retirement_due(self, inventory, now):
+        for directory in self.instances.iterdir():
+            if (directory.is_symlink() or not directory.is_dir()
+                    or not INSTANCE_ID.fullmatch(directory.name) or directory.name in inventory):
+                continue
+            retired = read_state(directory / "retired.json")
+            if not retired:
+                return True
+            confirmed = retired.get("confirmed_at")
+            if confirmed is not None and now - confirmed >= RETIRE_AFTER:
+                return True
+            if confirmed is None and now - retired.get("first_missing", now) >= CONFIRM_MISSING_AFTER:
+                return True
+        return False
+
     def run_instance(self, instance, *, force=False):
         area = self.area(instance)
         journal = area / "billing.json"
-        last = read_state(area / "latest.json")
         task = area / "task.json"
-        if not force and not task.exists() and archive_name(last.get("file")) and (area / last["file"]).is_file():
-            saved = datetime.fromisoformat(last["date"]).date()
-            if (datetime.now(CHINA_TIME).date() - saved).days < MIN_DAYS:
-                return
+        if not force and not self.backup_due(area):
+            return
         with instance_operation_lock(self.monitor_state, instance) as locked:
             if not locked:
                 return
@@ -250,6 +290,12 @@ class ColdBackup:
                 self.settle(api, journal)
                 if journal.exists():
                     return
+            old_task = read_state(task)
+            if old_task and not (old_task.get("id") or old_task.get("archive") or old_task.get("needs_review")):
+                old_task["needs_review"] = "task_id_missing"
+                store_json(task, old_task)
+            if old_task.get("needs_review"):
+                raise APIError("上次压缩任务状态不明，须在面板核对后再继续备份")
             if api.billing_cycle() is not None:
                 LOG.info("实例 %s：用户计费已开启，跳过夜间备份", instance)
                 return
@@ -262,7 +308,6 @@ class ColdBackup:
                 cycle = self.open_window(api, journal)
                 detail = api.request("GET", api.panel)
                 source = FileSource(api, detail)
-                old_task = read_state(task)
                 if not old_task:
                     raw = api.request("GET", api.panel + "/resources")["attributes"]
                     if raw["current_state"] != "offline":
@@ -276,21 +321,41 @@ class ColdBackup:
             finally:
                 signal.alarm(0)
                 self.settle(api, journal)
+            if journal.is_file():
+                raise APIError("备份计费尚未确认暂停，等待恢复任务复查")
+            (area / "failure.json").unlink(missing_ok=True)
 
     def run(self):
         self.recover()
-        rows = self.account.billing_instances(strict=True)
+        if datetime.now(CHINA_TIME).hour >= 4:
+            LOG.info("夜间备份窗口结束，剩余实例等下次凌晨")
+            return
+        inventory = self.inventory.read()
+        if (inventory is not None
+                and not any(self.backup_due(self.instances / instance) for instance in inventory)
+                and not self.retirement_due(inventory, time.time())):
+            LOG.info("本地检查：当前没有到期备份或清理任务")
+            return
+        rows, _ = self.inventory.refresh()
         self.retirement.reconcile(rows, time.time())
+        failures = 0
         for instance in rows:
             if datetime.now(CHINA_TIME).hour >= 4:
                 LOG.info("夜间备份窗口结束，剩余实例等下次凌晨")
-                return
+                break
             try:
                 self.run_instance(instance)
             except RateLimitError:
                 raise
             except (APIError, OSError, ValueError, KeyError, TypeError) as exc:
+                failures += 1
                 LOG.warning("实例 %s：冷备份待重试：%s", instance, exc)
+                try:
+                    store_json(self.instances / instance / "failure.json", {"at": time.time()})
+                except OSError:
+                    LOG.warning("实例 %s：无法保存冷备份失败记录", instance)
+        if failures:
+            raise APIError(f"{failures} 台实例的冷备份未完成，请查看服务日志")
 
     def purge_retired(self, instance):
         if not INSTANCE_ID.fullmatch(instance):

@@ -1,5 +1,6 @@
 """Minekuai account API and Minecraft Java server status probes."""
 
+import hashlib
 import http.client
 import io
 import json
@@ -34,6 +35,9 @@ class APIError(Exception):
 
 class AuthError(APIError):
     pass
+
+
+SESSION_REJECTED = "麦块拒绝了当前会话，已暂停自动请求。请重新授权，并检查面板是否有实例仍在计费"
 
 
 class InstanceNotFound(APIError):
@@ -77,14 +81,18 @@ def instance_operation_lock(directory, instance):
 
 
 class Minekuai:
-    def __init__(self, instance, auth_file):
+    def __init__(self, instance, auth_file, *, state_directory=None):
         self.instance = instance
         self.auth_file = auth_file
+        self.state_directory = state_directory
+        self.rejected_marker = None
         self.panel = f"/panel/servers/{instance}"
         self.expected_endpoint = None
 
-    def request(self, method, path, *, allow_uncoded=False, rows=False, timeout=10,
-                payload=None, allow_empty=False):
+    def for_instance(self, instance):
+        return Minekuai(instance, self.auth_file, state_directory=self.state_directory)
+
+    def _read_auth(self):
         try:
             auth = json.loads(self.auth_file.read_text(encoding="utf-8"))
             token, client_id = auth["token"], auth["clientid"]
@@ -93,6 +101,47 @@ class Minekuai:
                 raise ValueError
         except (OSError, KeyError, TypeError, ValueError):
             raise AuthError("麦块会话文件缺失或格式无效") from None
+        return token, client_id
+
+    def _session_marker(self, token, client_id):
+        if self.state_directory is None:
+            return None
+        fingerprint = hashlib.sha256(f"{token}\0{client_id}".encode("ascii")).hexdigest()
+        return self.state_directory / f".session-rejected-{fingerprint}"
+
+    def _check_session(self, marker):
+        if marker is None:
+            return
+        if marker == self.rejected_marker:
+            raise AuthError(SESSION_REJECTED)
+        try:
+            marker.stat()
+        except FileNotFoundError:
+            return
+        raise AuthError(SESSION_REJECTED)
+
+    def ensure_session_usable(self):
+        if self.state_directory is not None:
+            self._check_session(self._session_marker(*self._read_auth()))
+
+    def _reject_session(self, marker):
+        if marker is None:
+            return AuthError("麦块会话失效，需要重新授权")
+        self.rejected_marker = marker
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch(mode=0o600, exist_ok=False)
+        except FileExistsError:
+            pass
+        except OSError:
+            logging.getLogger(__name__).error("无法记录麦块会话失效，需检查 VPS 状态目录权限")
+        return AuthError(SESSION_REJECTED)
+
+    def request(self, method, path, *, allow_uncoded=False, rows=False, timeout=10,
+                payload=None, allow_empty=False):
+        token, client_id = self._read_auth()
+        marker = self._session_marker(token, client_id)
+        self._check_session(marker)
 
         conn = http.client.HTTPSConnection(API_HOST, timeout=timeout)
         try:
@@ -114,7 +163,7 @@ class Minekuai:
                 conn.request(method, path, body=body, headers=headers)
             response = conn.getresponse()
             if response.status in (401, 419):
-                raise AuthError("麦块会话失效，需要重新授权")
+                raise self._reject_session(marker)
             if response.status == 429:
                 raise RateLimitError(response.getheader("Retry-After"))
             if response.status == 404:
@@ -133,7 +182,7 @@ class Minekuai:
             raise APIError("麦块接口返回的结构异常")
         code = body.get("code")
         if code in (401, 419, "401", "419"):
-            raise AuthError("麦块会话失效，需要重新授权")
+            raise self._reject_session(marker)
         if code in (429, "429"):
             raise RateLimitError(response.getheader("Retry-After"))
         if code in (404, "404"):
@@ -256,6 +305,7 @@ class Minekuai:
         if not valid:
             raise APIError("实时控制台地址或凭据无效")
 
+        self.ensure_session_usable()
         try:
             with connect(address, origin=ORIGIN, proxy=None, open_timeout=10,
                          close_timeout=2, max_size=262_144, logger=WS_LOGGER) as ws:

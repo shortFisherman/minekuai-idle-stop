@@ -1,7 +1,9 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime
 from unittest.mock import Mock, patch
 from zipfile import ZipFile
 
@@ -87,6 +89,58 @@ class ColdBackupTests(unittest.TestCase):
             self.assertTrue(locked)
             worker.run_instance("aa001122", force=True)
         worker.api_for.assert_not_called()
+
+    def test_nightly_check_only_contacts_panel_for_due_backups(self):
+        worker = ColdBackup(self.directory / "auth", self.directory / "cold", self.directory)
+        instance = "aa001122"
+        worker.inventory.path.write_text(json.dumps({instance: ["example.net", 25565]}), encoding="utf-8")
+        area = worker.area(instance)
+        archive = area / self.first.name
+        archive.write_bytes(self.first.read_bytes())
+        store_json(area / "latest.json", {"file": archive.name, "date": "2026-11-07",
+                                        "size": archive.stat().st_size})
+        worker.inventory.refresh = Mock(return_value=({instance: {}}, {instance: None}))
+        worker.run_instance = Mock()
+        with patch("cold_backup.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 13, 2)
+            worker.run()
+            worker.inventory.refresh.assert_not_called()
+            worker.run_instance.assert_not_called()
+            clock.now.return_value = datetime(2026, 11, 14, 2)
+            worker.run()
+        worker.inventory.refresh.assert_called_once()
+        worker.run_instance.assert_called_once_with(instance)
+
+    def test_missing_remote_task_is_parked_before_another_billing_window(self):
+        worker = ColdBackup(self.directory / "auth", self.directory / "cold", self.directory)
+        instance = "aa001122"
+        area = worker.area(instance)
+        task = {"roots": ["world"], "id": "previous-task"}
+        store_json(area / "task.json", task)
+        worker.list_tasks = Mock(return_value=[])
+        with self.assertRaises(APIError):
+            worker.finish_archive(Mock(), area, task, "test-cycle")
+        self.assertEqual(json.loads((area / "task.json").read_text())["needs_review"], "task_not_found")
+        self.assertFalse(worker.backup_due(area))
+        worker.api_for = Mock()
+        worker.run_instance(instance)
+        worker.api_for.assert_not_called()
+        with self.assertRaises(APIError):
+            worker.run_instance(instance, force=True)
+        worker.api_for.return_value.resume_billing.assert_not_called()
+
+    def test_nightly_failure_is_visible_and_does_not_skip_other_instances(self):
+        worker = ColdBackup(self.directory / "auth", self.directory / "cold", self.directory)
+        failed, other = "aa001122", "aa001123"
+        worker.area(failed)
+        worker.inventory.refresh = Mock(return_value=({failed: {}, other: {}}, {}))
+        worker.run_instance = Mock(side_effect=[APIError("download interrupted"), None])
+        with patch("cold_backup.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 28, 2)
+            with self.assertRaises(APIError):
+                worker.run()
+        self.assertEqual(worker.run_instance.call_count, 2)
+        self.assertTrue((worker.area(failed) / "failure.json").is_file())
 
     def test_download_resumes_only_with_matching_range(self):
         source = FileSource.__new__(FileSource)

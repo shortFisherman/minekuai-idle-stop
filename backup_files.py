@@ -63,6 +63,7 @@ class FileSource:
             offset = 0
         args = urlencode({"file": str(path)})
         signed = self.api.request("GET", self.path + "/download?" + args, allow_uncoded=True)
+        self.api.ensure_session_usable()
         fields = signed.get("attributes", signed) if isinstance(signed, dict) else {}
         try:
             url = fields["url"]

@@ -141,12 +141,14 @@ class Keepalive:
             return True
         if self.api.power_state(timeout=4) == "offline":
             attempts = record.get("pause_attempts", int(record["pause_sent"]))
-            if attempts >= 2:
+            if attempts >= 3:
                 self.report("保活停费仍未确认，需要在麦块页面核对")
                 return False
+            if attempts == 2 and self.following_up:
+                return False  # Give the panel time to settle before the final retry.
             if attempts and time.time() - record.get("last_pause_attempt", 0) < RECHECK_SECONDS:
                 return False
-            if self.api.billing_cycle(timeout=4) != cycle:
+            if self.api.billing_cycle(timeout=4) != cycle or self.api.power_state(timeout=4) != "offline":
                 return False
             record.update(
                 cycle=cycle, pause_sent=True, pause_attempts=attempts + 1,
@@ -154,7 +156,12 @@ class Keepalive:
             )
             self.save(record)
             self.report("计费已开启，正在立即暂停")
-            self.api.pause_billing(timeout=4)
+            try:
+                self.api.pause_billing(timeout=4)
+            except (AuthError, RateLimitError):
+                raise
+            except APIError:
+                pass  # Verify billing before deciding whether to send another request.
             if self.api.billing_cycle(timeout=4) is None:
                 self.clear(self.age)
                 self.report("计时卡保活完成，已确认恢复暂停计费")

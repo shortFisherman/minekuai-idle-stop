@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 
-from minekuai import APIError, InstanceNotFound, Minekuai, RateLimitError
+from minekuai import APIError, InstanceNotFound, RateLimitError
 
 LOG = logging.getLogger("minekuai-cold")
 RETIRE_AFTER = 30 * 86400
@@ -45,7 +45,7 @@ class BackupRetirement:
         self.instances = instances
 
     def is_gone(self, instance):
-        api = Minekuai(instance, self.account.auth_file)
+        api = self.account.for_instance(instance)
         try:
             detail = api.request("GET", api.panel)
         except InstanceNotFound:

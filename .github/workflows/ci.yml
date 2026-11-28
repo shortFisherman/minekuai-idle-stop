@@ -25,6 +25,7 @@ jobs:
           cmp config.example.json /etc/minekuai-stop/config.json
           /opt/minekuai-stop/venv/bin/python /opt/minekuai-stop/monitor.py --help
           /opt/minekuai-stop/venv/bin/python /opt/minekuai-stop/authorize.py --help
+          /opt/minekuai-stop/venv/bin/python /opt/minekuai-stop/status.py --help
           /opt/minekuai-stop/venv/bin/python /opt/minekuai-stop/cold_backup.py --help
           sudo systemd-analyze verify /etc/systemd/system/minekuai-stop.service
           sudo systemd-analyze verify /etc/systemd/system/minekuai-cold.service \
